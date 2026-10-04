@@ -1,0 +1,26 @@
+import xyz.wagyourtail.unimined.internal.minecraft.MinecraftProvider
+
+plugins {
+    id 'dg-mc-conventions'
+}
+
+unimined.minecraft {
+    version "1.8.9"
+
+    mappings {
+        legacyIntermediary()
+        legacyYarn(541)
+
+        devFallbackNamespace "intermediary"
+    }
+
+    customPatcher(new CustomLegacyFabricMinecraftTransformer(project, delegate as MinecraftProvider)) {
+        it.loader libs.versions.fabric.loader.get()
+    }
+
+    runs.config("server") {
+        javaVersion = JavaVersion.VERSION_21
+    }
+
+    defaultRemapJar = true
+}

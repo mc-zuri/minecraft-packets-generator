@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "minecraft-data-generator",
+  "version": "${version}",
+  "name": "Minecraft Packets Generator",
+  "description": "Generate packet samples and ordered wire-type traces from vanilla Minecraft.",
+  "authors": [
+    "Archengius",
+    "U9G"
+  ],
+  "contact": {
+    "sources": "https://github.com/mc-zuri/minecraft-packets-generator"
+  },
+  "license": "MIT",
+  "mixins": [
+    "minecraft-data-generator.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": "*",
+    "minecraft": "*"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "dev.minecraftdatagenerator.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "mixins": [
+    "ReadyMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  },
+  "server": [
+    "EULAMixin"
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "name": "minecraft-packets-generator",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Generate vanilla Minecraft packet corpora and verify ordered wire types against minecraft-data.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mc-zuri/minecraft-packets-generator.git"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test tools/*.test.js",
+    "bump": "node tools/newVersion.js"
+  },
+  "dependencies": {
+    "minecraft-data": "3.116.0",
+    "minecraft-protocol": "1.68.0",
+    "prismarine-nbt": "2.8.0",
+    "protodef": "1.19.0"
+  }
+}

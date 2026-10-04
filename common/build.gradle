@@ -1,0 +1,30 @@
+plugins {
+    id 'dg-java-conventions'
+}
+
+dependencies {
+    api 'com.google.code.gson:gson:2.13.1'
+    implementation 'io.github.classgraph:classgraph:4.8.179'
+    implementation "net.lenni0451:Reflect:1.5.0"
+}
+
+configurations {
+    packetgenNetty40
+    packetgenNetty41
+}
+dependencies {
+    packetgenNetty40 'io.netty:netty-all:4.0.10.Final'
+    packetgenNetty41 'io.netty:netty-buffer:4.1.97.Final'
+}
+['40', '41'].each { abi ->
+    tasks.register("packetgenNetty${abi}Test", JavaExec) {
+        dependsOn testClasses
+        classpath = sourceSets.test.runtimeClasspath + configurations.getByName("packetgenNetty${abi}")
+        mainClass = 'dev.minecraftdatagenerator.packetgen.BufferTracingTest'
+    }
+}
+tasks.register('packetgenTest', JavaExec) {
+    dependsOn testClasses, 'packetgenNetty40Test', 'packetgenNetty41Test'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'dev.minecraftdatagenerator.packetgen.PacketGenTest'
+}

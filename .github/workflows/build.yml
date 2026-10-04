@@ -1,0 +1,54 @@
+name: Packet generator checks
+on: [push, pull_request]
+permissions:
+  contents: read
+
+jobs:
+  versions:
+    runs-on: ubuntu-latest
+    outputs:
+      modules: ${{ steps.modules.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: modules
+        run: |
+          node -e 'const fs = require("fs"); const versions = require("./versions.json"); const actual = fs.readdirSync("mc").sort(); if (JSON.stringify([...versions].sort()) !== JSON.stringify(actual)) throw Error("Version inventory mismatch"); console.log("value=" + JSON.stringify(versions))' >> "$GITHUB_OUTPUT"
+
+  compile:
+    needs: versions
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.versions.outputs.modules) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: |
+            25
+            21
+      - uses: gradle/actions/setup-gradle@v4
+      - run: bash gradlew :mc:${{ matrix.version }}:compileJava --console=plain
+
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: gradle/actions/setup-gradle@v4
+      - run: npm ci
+      - run: npm test
+      - run: python -m unittest discover -s tools -p 'test_*.py'
+      - run: bash gradlew :common:packetgenTest --console=plain

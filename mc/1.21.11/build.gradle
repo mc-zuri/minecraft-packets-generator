@@ -1,0 +1,32 @@
+import xyz.wagyourtail.unimined.internal.minecraft.MinecraftProvider
+
+plugins {
+    id 'dg-mc-conventions'
+}
+
+dependencies {
+    // Runtime-present via :common, but needed on this module's compile classpath for
+    // PacketSamplesDataGenerator's packet-class discovery.
+    implementation 'io.github.classgraph:classgraph:4.8.179'
+}
+
+unimined.minecraft {
+    version "1.21.11"
+
+    mappings {
+        mojmap()
+
+        devNamespace "mojmap"
+        devFallbackNamespace "intermediary"
+    }
+
+    customPatcher(new CustomOfficialFabricMinecraftTransformer(project, delegate as MinecraftProvider)) {
+        it.loader libs.versions.fabric.loader.get()
+    }
+
+    runs.config("server") {
+        javaVersion = JavaVersion.VERSION_21
+    }
+
+    defaultRemapJar = true
+}

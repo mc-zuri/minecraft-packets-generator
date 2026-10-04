@@ -1,0 +1,17 @@
+plugins {
+    id 'org.gradle.toolchains.foojay-resolver-convention' version '1.0.0'
+}
+
+dependencyResolutionManagement {
+    versionCatalogs {
+        libs {
+            version('fabric-loader', '0.18.4')
+        }
+    }
+}
+
+rootProject.name = "minecraft-packets-generator"
+
+include "common"
+
+new File(rootProject.projectDir, "mc").list().toList().forEach { include ":mc:$it" }

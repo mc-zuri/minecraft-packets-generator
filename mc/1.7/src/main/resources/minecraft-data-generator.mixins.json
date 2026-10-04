@@ -1,0 +1,16 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "dev.minecraftdatagenerator.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "mixins": [
+    "ReadyMixin",
+    "accessor.BiomeAccessor",
+    "accessor.EnchantmentAccessor",
+    "accessor.EntityTypeAccessor",
+    "accessor.StatusEffectAccessor"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

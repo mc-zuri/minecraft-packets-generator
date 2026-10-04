@@ -1,0 +1,34 @@
+import xyz.wagyourtail.unimined.internal.minecraft.MinecraftProvider
+
+plugins {
+    id 'dg-mc-conventions'
+}
+
+// This snapshot declares an unclassified native epoll artifact that was never published.
+// Windows uses the NIO transport; excluding the Linux native artifact also permits remapping.
+if (System.getProperty('os.name').startsWith('Windows')) {
+    configurations.configureEach {
+        exclude group: 'io.netty', module: 'netty-transport-native-epoll'
+    }
+}
+
+unimined.minecraft {
+    version "22w19a"
+
+    mappings {
+        intermediary()
+        yarn(6)
+
+        devFallbackNamespace "intermediary"
+    }
+
+    customPatcher(new CustomOfficialFabricMinecraftTransformer(project, delegate as MinecraftProvider)) {
+        it.loader libs.versions.fabric.loader.get()
+    }
+
+    runs.config("server") {
+        javaVersion = JavaVersion.VERSION_21
+    }
+
+    defaultRemapJar = true
+}
