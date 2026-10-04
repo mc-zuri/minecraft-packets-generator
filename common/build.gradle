@@ -6,6 +6,8 @@ dependencies {
     api 'com.google.code.gson:gson:2.13.1'
     implementation 'io.github.classgraph:classgraph:4.8.179'
     implementation "net.lenni0451:Reflect:1.5.0"
+    // Packet streams are zstd-compressed; Node reads them with zlib.createZstdDecompress.
+    implementation 'com.github.luben:zstd-jni:1.5.7-21'
 }
 
 configurations {

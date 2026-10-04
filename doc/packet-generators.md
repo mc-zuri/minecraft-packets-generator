@@ -1,206 +1,111 @@
-# Packet generators
-
-## Public output
-
-The Python runner and root `just packets` command publish exactly two files per packet name:
-`<version>/<state>/<direction>/<packet>.bin` and `<packet>.mappings.json.gz`.
-The binary includes all committed frames followed by the same compressed mappings. Contexts
-share the pair. See [the binary layout and reader](packet-bundle-format.md).
-
-The chunked files described below are private working state under `build/packet-runs`,
-not the public `--output` directory. Logs and `run.json` also stay there. Use `--work-dir`
-to choose their location, or `--export-only` to compact an existing verified run.
-
-## Shared generator (default)
+# Packet generator
 
 `SharedPacketDataGenerator` is compiled once in `common` and runs in all 30 modules in
-`versions.json`. Its runtime adapter discovers the actual registration table and uses the
-registered encoder and decoder. It supports both legacy `PacketByteBuf` read/write packets and
-modern `StreamCodec` dispatch. Java reflection constructs candidate values; **wire types are
-recorded from the encoder's buffer operations**, never inferred from Java field declarations.
+`versions.json`. It runs inside a dedicated server started by Fabric, so codecs, registries, the
+world and entities are the real ones. Output and options are described in the
+[README](../README.md); the file format in [packet-stream-format.md](packet-stream-format.md).
 
-Identity is `(state, direction, network id, protocol context)`. Reused packet classes retain every
-registration. Boolean protocol-context combinations have separate entries. Bundle delimiters use
-the registered singleton. Clientbound custom payloads use the codec bound to their state.
+## Inventory
 
-Run generation and minecraft-data verification for all modules:
+The runtime adapter (`RuntimePacketAdapter`) reads the registration table the game actually uses:
+`<State>Protocols` templates and their registered `StreamCodec`s from 1.20.5, the
+`NetworkState`/`ConnectionProtocol` packet maps before. A registration is
+`(state, direction, network id, protocol context)`; boolean protocol contexts (26.x serverbound
+play has four) are separate registrations that share one output file. Legacy packet names are
+the mapped class names; modern names are the vanilla packet ids.
 
-```powershell
-python tools/run-packet-corpus.py --output build/packet-corpus-run --minecraft-data <minecraft-data-checkout>
-```
+## Domains
 
-Use `--versions 1.12.2 1.20.4 26.3` to select modules, `--budget 40960` to change the
-**per-registration reflective attempt budget** (default 256), and `--resume` to continue the same output.
-Normal runs always visit every handwritten regression seed before spending that budget.
-`--smoke` explicitly applies the budget to all attempts, including seeds, for small tests.
-Attempts include rejected constructions/encodes and duplicates, so the budget is not a sample quota.
-Each protocol context gets its own budget. `--filter status/`
-limits the run while retaining filtered registrations in the inventory. The runner resolves each
-actual runtime version from the selected checkout's dataPaths and protocol-version tables, including schema aliases.
-`run.json` records generation and mapping outcomes separately; logs are saved per module.
+`ReflectionShapes` builds a finite domain (`ShapePlan`) for each packet class: products over
+constructor or record parameters and, for legacy mutable packets, their non-final fields; unions
+over constructors, static factories, sealed subtypes, selected dispatch interfaces, optional
+presence and collection/map lengths 0, 1 and 2. Leaves are boundary pools per Java type
+(VarInt group boundaries and `MIN`/`MAX` for ints, every 7-bit group for longs, signed zero,
+NaN and infinities for floats, multi-byte UTF-8 strings) and live fixtures (`RuntimeFixtures`):
+registry values and holders, tag keys and holder sets, entity-data serializers paired with values
+of their type, JOML vectors and quaternions, block positions, items, text components, the world
+border, boss events, keys and signatures.
 
-Direct Gradle runs generate only packets and accept `PACKETGEN_OUTPUT_DIR`, `PACKETGEN_MAX_SHAPES`,
-`PACKETGEN_CHUNK_SIZE` (default 256), `PACKETGEN_FILTER`, `PACKETGEN_SMOKE=1`, and `PACKETGEN_RESUME=1`.
-A JDK is required: legacy tracing buffers are compiled against the running buffer ABI.
-The runner assigns a free positive server port immediately before launch. Legacy tracing wraps both
-the game buffer and its Netty delegate; UTF-8 helpers use the observable public-write path. The
-ordinary vanilla re-encoder checks that this instrumentation preserves the encoded bytes.
-The JVM returns 0 for completion, 2 for remaining/filtered work, and 1 for failures. Gradle wraps
-nonzero JVM exits as its own failure; use the manifest or Python runner for the precise outcome.
+Every value pool and every alternative is a *decision node*. Nodes are interned by their position
+in the value tree (`NodeTable`), so two list elements are two nodes and every sample is identified
+by its decision vector. Nothing is dropped silently:
 
-### Domains and coverage
+- An alternative whose domain is empty (an abstract type without a fixture, a class without a
+  usable constructor) is pruned from its union and recorded in the plan's `unresolved` list.
+- Below the depth limit (6) values are built in terminal mode: empty containers, absent
+  optionals, first enum constants and the cheapest terminating constructor. The enclosing branch
+  survives; the position is recorded in `terminal`.
 
-The common engine lazily enumerates full Cartesian products of its declared finite domains:
-all enum values, both booleans, integer width boundaries, full signed 64-bit VarLong boundaries,
-UTF-8 examples, optional absent/present combinations, and arrays/collections/maps of sizes 0/1/2.
-Products use `BigInteger` ordinals and a bijective traversal that rotates slower dimensions using
-the faster digits. Early attempts vary all fields instead of exhausting the last field first.
-Constructor, collection-size, and dispatch alternatives are interleaved, so a large first branch
-cannot starve later branches. Resume seeks directly without replaying an exhausted prefix.
-Handwritten recipes run in full outside the reflection budget. The manifest and public mappings
-record `samplingProfile`, `seedAttemptsTotal`, and `seedAttemptsCompleted` to distinguish this
-from a smoke prefix. Registry fixtures
-select concrete value classes and ID width boundaries. Nested records, generic parameters,
-constructors, factories, sealed branches, selected dispatch interfaces, and legacy mutable packet
-fields share the same reflection engine. Constrained values have explicit runtime fixtures.
+## Sampling
 
-This is exhaustive over the **declared domains**, not all possible Minecraft values. Depth limits,
-unresolved types, invalid constructor combinations, and rejected encodes remain visible. In
-particular, reflection cannot discover every hidden semantic constraint or serializer branch.
-A small-budget smoke run does not establish full packet coverage. Check each entry's `samples`,
-`remaining`, `rejected`, `gaps`, and `domainCoverage` before interpreting a successful mapping.
-If every candidate in an exhausted domain raises vanilla's `SkipPacketEncoderException`, the
-registration has status `encoderSkipped` and a matching attempt count. This records intentional
-protocol-context suppression (for example creative-inventory packets outside creative mode).
-An incomplete prefix or a mixture of skips and other failures cannot receive this status.
-Skipped contexts retain their rejection provenance and are not counted as sampled contexts.
+`Sampler` chooses what to attempt for one registration:
 
-### Chunked output and resume
+1. **Seeds.** Handwritten recipes (`shared/packetshapes`, selected per module by its `.sources`
+   manifest) and adapter seeds are enumerated in full, outside the budget.
+2. **Exhaustive.** A domain no larger than `max(threshold, cap)` is enumerated with an odometer
+   over the decision tree. A construction that fails prunes every combination below it.
+3. **Each choice.** Otherwise every alternative of every node is attempted at least once, varying
+   one decision from the sample where the node was first seen. An alternative rejected twice (once
+   with random context) is recorded as infeasible. A node whose every variation re-encodes to an
+   existing frame never reaches the wire (for example a legacy field the base packet does not
+   write); it is marked inert and held fixed.
+4. **Pairwise.** Every compatible pair of alternatives among the first 128 tracked nodes (first 32
+   alternatives each) occurs in some sample. Each attempt starts from an uncovered pair, forces the
+   union branches that lead to both nodes, then picks the remaining alternatives greedily to cover
+   the most open pairs. Pairs that cannot share a sample (different branches of one union) are
+   excluded; pairs that fail three times are infeasible.
+5. **Random.** Seeded random decisions until the cap of accepted samples, or until fewer than 1%
+   of a window of attempts yields a new frame (`saturated`).
 
-Each **private working** runtime directory contains `packetCorpus.json` (format 3) and:
+Ceilings bound every registration: 4 x cap attempts, `--max-seconds` of sampling time (some
+legacy constructors allocate by an `int` argument) and `--max-frame-mb` of frame bytes (chunk and
+login packets have frames of tens of KB). The coverage record states which stop applied.
 
-```text
-packet-corpus/<state>/<direction>/<packet>[/<context>]/
-  checkpoint.json
-  part-000000.bin
-  part-000000.json
-  ...
-```
+## Validation and tracing
 
-Binary chunks contain length-prefixed frames (`VarInt length`, `VarInt packet id`, body).
-Sidecars retain ordered semantic and primitive writes, offsets, Java values, reader evidence,
-trace coverage, source decode/full-consumption checks, and vanilla re-encoding stability.
-Every attempted ordinal has provenance, including duplicates and rejection reasons. Deduplication
-only admits samples that vanilla decodes completely and re-encodes identically. Rejected source
-candidates retain `rejectedHex` and `rejectedSource` in private provenance, including decode or
-re-encode errors and the recorded writes. This separates invalid generated values from positive
-codec comparison cases without discarding the evidence. Deduplication
-requires identical bytes **and trace/source evidence**; identical bytes written with different
-Java types stay separate. Chunk size bounds buffered output; the dedup index grows with unique
-samples and handwritten providers still construct their seed lists eagerly.
+Each candidate is encoded by vanilla, then decoded from a tracing buffer: there must be no unread
+bytes. The decoded value is re-encoded into a tracing buffer and must reproduce the bytes exactly,
+so the trace always describes the canonical encoding. Seeds, the each-choice stage and a sample of
+the other stages also compare the decoded value with the input and flag lossy encodings.
 
-A checkpoint commits both chunk hashes and its next ordinal atomically. Resume verifies those
-hashes and fingerprints the mapped game artifact, generator/provider classes, Netty artifact,
-Java runtime, registry identities/order, and available world seed. Changed code or fixtures require
-a new output directory. Use the same unchanged generator world for a resumed run. Public-key
-and encrypted-byte seeds are deterministic wire fixtures, not live authentication credentials.
+Writes are recorded by `WireTrace` (1.20.5+, the innermost buffer of every `FriendlyByteBuf`
+wrapper, with mixin scopes grouping VarInt, VarLong, UTF-8 string and BlockPos writes) and by
+generated `TracedBuffer`/`TracedRawBuffer` classes compiled at runtime against each legacy
+version's buffer ABI. Reads are recorded the same way (`ReadTrace` and the legacy buffers):
+every typed read, bulk read, skip and reader-index move, with its length. `TraceAlign` pairs each
+write with the reads over the same bytes, which gives the read kind per op (`readByte` vs
+`readUnsignedByte` is the authority for signedness) or marks the sample misaligned.
 
-Generation progress, unresolved domains, source validity, and Node compatibility are separate
-facts. A zero-sample registration is reported, never silently omitted. Full-width VarLong samples
-are retained even when the Node serializer cannot handle them. A byte-stable Node round trip alone
-does not prove matching Java data types; the mapper also compares field spans and recorded writes.
-Opaque composite fields remain explicitly marked.
+Identical bytes with identical write/read evidence are stored once per registration; identical
+evidence in another protocol context is stored as an alias.
 
-Before extraction, validation on 2026-10-01 covered all 30 runtime inventories and produced samples for all
-5,662 distinct `(version, state, direction, id)` registrations across bounded runs, with no
-incomplete primitive traces. Eleven additional non-creative protocol contexts deliberately
-reject creative-slot packets. These runs do not exhaust the declared shape domains and do
-not establish that every minecraft-data mapping passes. Source-validation failures, type/schema
-differences, opaque mappings, and Node's full-width VarLong limitation remain in the results.
-The original checkout retains `build/shared-packet-verification.json` and its linked corpora;
-these generated artifacts are not part of this repository. A real JVM restart also verified checkpoint resume and duplicate provenance.
+## Plan pass and budget
 
-Map an existing chunked corpus (the older flat format is also supported):
+`PACKETGEN_PLAN_ONLY=1` builds every registration's plan and runs a short calibration (4 warm-up
+and 16 timed random attempts) without writing streams. The runner caches the result per module
+source hash and uses it to project samples, size and time for the budget prompt.
 
-```powershell
-node tools/packet-type-mappings.js <protocol.json> <runtime-dir>/packetCorpus.json <mapping-output>
-```
+## External candidates
 
-### Shared recipes and regression checks
+Frames from other producers (`PACKETGEN_CANDIDATES_DIR`) go through the same validation. A
+frame that vanilla decodes fully but re-encodes differently is non-canonical: its canonical
+re-encoding is validated and stored, and the original is stored as a decode-only sample that
+references it. Each candidate's outcome (`accepted`, `duplicate`, `non-canonical` with the
+canonical bytes and first difference, or `rejected` with a reason such as `wrong-id`,
+`truncated-frame`, `decode`, `trailing-bytes` or `reencode`) is written to `external-results`.
 
-Identical recipe/trace sources live under `shared/packetshapes/<source-version>/`.
-`shared/packetshapes/<module>.sources` chooses the exact files compiled against each module's API;
-version-specific recipes remain inside that module. Edit a shared source once for all modules that
-select it. When adding a version, choose compatible sources in its manifest and compile that module.
+## Known limitations
 
-```powershell
-./gradlew.bat :common:packetgenTest
-node --test tools/packet-type-mappings.test.js
-```
-
-The Java checks exercise nested domains, generic records, large products, deduplication with
-provenance, and resumable checkpoints. They also compile and exercise the generated underlying
-buffer wrapper on both Netty 4.0 and 4.1, including nested writes, UTF-8, and signed 64-bit values. The Node checks include authoritative inventory entries,
-chunk integrity, mapping/type discrepancies, empty packets, and source validity classifications.
-
-## Standalone dependencies
-
-Run `npm ci` before verification. Node 22+, Python 3.9+, and JDKs 21/25 are required.
-Generation uses only this repository and normal Gradle dependencies. The verifier's helpers
-live in `tools/lib`; no skill directory or sibling generator checkout is loaded.
-
-Without `--minecraft-data`, the runner selects the installed npm package's data. An explicit
-raw checkout needs `data/dataPaths.json` and `data/pc/common/protocolVersions.json`. A direct
-version entry takes precedence; otherwise the resolver prefers an available release with the
-same protocol ID, then the declared major-version schema. It never guesses a snapshot for an
-unknown release. The pinned package predates final 26.3; all-version verification needs a
-checkout containing that schema.
-
-The default serializer is the locked npm compiler with the retained compatibility fixes in
-[THIRD_PARTY.md](../THIRD_PARTY.md). `MCP_DIR` selects another node-minecraft-protocol checkout
-and its dependencies exactly as provided, without those bundled fixes. The fixed protocol file
-under `tools/fixtures` is a regression-test fixture, not a runtime fallback.
+- The domains are boundary values and fixtures, not every value Minecraft accepts. Deep
+  structures (advancements, recipes, command trees) are partly represented by terminal values and
+  handwritten seeds; the plan lists every unresolved and terminal position.
+- Generation needs a JDK: legacy tracing buffers are compiled at runtime.
+- zstd-jni loads a native library; Java 25 prints a restricted-method warning unless
+  `--enable-native-access=ALL-UNNAMED` is passed (the runner does).
 
 ## Compatibility generators
 
-The shared generator is the default for every module. These earlier modes remain available:
-
-- `PACKETGEN_MANUAL=1`: handwritten packet shapes in the 13 modules from 1.20.5 onward.
-- `PACKETGEN_MODE=reflective`: earlier reflection generator in 1.21.11, 26.1, 26.2, and 26.3.
-
-Use these variables with direct Gradle runs. The all-version Python runner always selects the
-shared engine and clears compatibility flags. Compatibility output uses the older flat
-`packets/<state>/<direction>/<packet>.bin` and `.json` layout, plus `packetShapes.json` or
-`packetSamples.json`. The mapper still supports this format. These modes do not support the
-shared engine's resumable Cartesian-product traversal.
-
-The four newest modules also emit `packets.json`, an inventory keyed by state, direction, and
-network ID. Set `PACKETGEN_PROTOCOL_JSON` to an exact schema file to enable its optional ID
-comparison. Without that variable, the comparison is explicitly skipped; the Python runner
-performs schema resolution and full trace verification separately.
-
-Both modes honor the output-directory override. The earlier reflection mode also honors
-`PACKETGEN_MAX_SHAPES`; manual mode runs its complete recipe lists and does not use that budget
-or the shared engine's path filter. Select compatibility modes only on the modules listed here.
-
-## Verification results
-
-The mapper compares each frame with protocol reads, writes, byte spans, values, and vanilla
-source validation. It preserves explicit mismatches, opaque composite mappings, uncertain
-signedness, source decode failures, and byte instability. It cannot prove unobserved branches.
-
-Full signed 64-bit VarLong boundary values remain in the corpus. The standalone pinned npm codec's
-32-bit VarInt implementation cannot represent all of them; these are recorded as known limitations, not
-silently accepted or removed. Generation/verification returns 0 for complete, 2 for incomplete,
-and 1 for failures. A bounded run may legitimately report existing source/schema failures;
-inspect its report rather than interpreting every nonzero Gradle exit as a launch failure.
-
-## Moving existing outputs
-
-Old corpora remain readable by the standalone verifier. Start new private working directories after
-extraction: removing unrelated generator classes changes the runtime fingerprints, so old
-checkpoints must not be resumed with this build. Fresh checkpoints can resume across JVM
-restarts while code, fixtures, Java runtime, and world remain unchanged. The spread/interleaved
-traversal changes the fingerprint; do not resume an old lexicographic checkpoint with it.
-Publication rejects per-context sample-count regressions, including a smoke export over a richer
-packet. Use a separate public output when intentionally generating a smaller corpus.
+The shared generator is the default for every module. Two earlier modes remain for direct Gradle
+runs and write their own flat JSON format: `PACKETGEN_MANUAL=1` (handwritten shapes only, in the
+13 modules from 1.20.5) and `PACKETGEN_MODE=reflective` (earlier reflection engine, in 1.21.11 and
+26.x). The runner always uses the shared generator.

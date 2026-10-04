@@ -29,7 +29,7 @@ public final class GeneratedBuffers implements AutoCloseable {
             if (Modifier.isFinal(m.getModifiers()) || Modifier.isStatic(m.getModifiers())) continue;
             String kind = classify(m); if (kind == null) continue;
             Class<?>[] params = m.getParameterTypes();
-            boolean reading = m.getName().startsWith("read") && !kind.equals("view");
+            boolean reading = reading(m, kind);
             boolean semantic = Set.of("varint", "varlong", "string", "blockpos").contains(kind);
             source.append("@Override public ").append(m.getReturnType().getCanonicalName()).append(' ').append(m.getName()).append('(');
             for (int i = 0; i < params.length; i++) { if (i > 0) source.append(','); source.append(params[i].getCanonicalName()).append(" p").append(i); }
@@ -77,7 +77,7 @@ public final class GeneratedBuffers implements AutoCloseable {
         for (Method m : methods.values()) {
             if (m.getName().equals("compareTo") && Arrays.equals(m.getParameterTypes(), new Class<?>[]{Object.class})) continue;
             Class<?>[] params = m.getParameterTypes(); String kind = classify(m);
-            boolean reading = m.getName().startsWith("read") && !"view".equals(kind);
+            boolean reading = kind != null && reading(m, kind);
             source.append("@Override public ").append(m.getReturnType().getCanonicalName()).append(' ').append(m.getName()).append('(');
             for (int i = 0; i < params.length; i++) { if (i > 0) source.append(','); source.append(params[i].getCanonicalName()).append(" p").append(i); }
             source.append(')');
@@ -95,8 +95,15 @@ public final class GeneratedBuffers implements AutoCloseable {
         }
         return source.append("}\n").toString();
     }
+    private static boolean reading(Method m, String kind) {
+        return !kind.equals("view") && !kind.equals("patch") && (m.getName().startsWith("read") || kind.equals("skip"));
+    }
     private static String classify(Method m) {
         String name = m.getName();
+        // Reads that consume bytes without a typed value: bulk copies, slices and index moves
+        // (e.g. a string payload consumed by advancing the reader index).
+        if (name.equals("readerIndex") && m.getParameterCount() == 1 || name.equals("skipBytes") || name.equals("resetReaderIndex")) return "skip";
+        if (name.equals("readBytes") || name.equals("readSlice") || name.equals("readRetainedSlice") || name.equals("readCharSequence")) return "bytes";
         if (name.startsWith("set") && !name.equals("setIndex") || Set.of("clear", "discardReadBytes", "discardSomeReadBytes", "resetWriterIndex", "setIndex").contains(name) || name.equals("writerIndex") && m.getParameterCount() == 1) return "patch";
         if (Set.of("slice", "retainedSlice", "duplicate", "retainedDuplicate", "readSlice", "readRetainedSlice", "array", "nioBuffer", "nioBuffers", "internalNioBuffer", "unwrap", "memoryAddress").contains(name)) return "view";
         if (name.equals("writeVarInt")) return "varint";
@@ -108,9 +115,9 @@ public final class GeneratedBuffers implements AutoCloseable {
         if (suffix.equals(name)) return null;
         return switch (suffix) {
             case "Boolean" -> "bool"; case "Byte" -> "i8"; case "UnsignedByte" -> "u8";
-            case "Short" -> "i16"; case "UnsignedShort" -> "u16"; case "ShortLE" -> "li16";
-            case "Medium" -> "i24"; case "MediumLE" -> "li24";
-            case "Int" -> "i32"; case "UnsignedInt" -> "u32"; case "IntLE" -> "li32";
+            case "Short" -> "i16"; case "UnsignedShort" -> "u16"; case "ShortLE" -> "li16"; case "UnsignedShortLE" -> "lu16";
+            case "Medium" -> "i24"; case "MediumLE" -> "li24"; case "UnsignedMedium" -> "u24"; case "UnsignedMediumLE" -> "lu24";
+            case "Int" -> "i32"; case "UnsignedInt" -> "u32"; case "IntLE" -> "li32"; case "UnsignedIntLE" -> "lu32";
             case "Long" -> "i64"; case "LongLE" -> "li64"; case "Char" -> "char";
             case "Float" -> "f32"; case "Double" -> "f64";
             default -> null;

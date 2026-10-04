@@ -17,9 +17,10 @@ public class MinecraftDataGenerator {
         System.setOut(new PrintStream(new FileOutputStream(FileDescriptor.out)));
         System.setErr(new PrintStream(new FileOutputStream(FileDescriptor.err)));
         MinecraftDataGenerator.LOGGER.info("Starting data generation for version %s".formatted(versionName));
+        // Private working files (summary, plan, caches); the packet streams go to PACKETGEN_OUTPUT_DIR.
         Path dataDumpDirectory = serverRootDirectory.resolve("minecraft-data").resolve(versionName);
-        String packetOutput = System.getenv("PACKETGEN_OUTPUT_DIR");
-        if (packetOutput != null && !packetOutput.isBlank()) dataDumpDirectory = Path.of(packetOutput).resolve(versionName);
+        String work = System.getenv("PACKETGEN_WORK_DIR");
+        if (work != null && !work.isBlank()) dataDumpDirectory = Path.of(work);
         runtimeVersion = versionName;
         outputDirectory = dataDumpDirectory.toAbsolutePath().normalize();
         boolean success = DataGenerators.runDataGenerators(dataDumpDirectory);
@@ -27,7 +28,7 @@ public class MinecraftDataGenerator {
         if (success && packetExit == 0) {
             MinecraftDataGenerator.LOGGER.info("Data generation successful!");
         } else if (success && packetExit == 2) {
-            MinecraftDataGenerator.LOGGER.warning("Packet corpus incomplete; remaining combinations are checkpointed for resume.");
+            MinecraftDataGenerator.LOGGER.warning("Packet corpus incomplete; see summary.json for stop reasons and unresolved domains.");
         } else {
             MinecraftDataGenerator.LOGGER.severe("Data generation failed!");
         }

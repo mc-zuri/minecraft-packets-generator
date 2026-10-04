@@ -11,8 +11,9 @@ public final class SharedPacketDataGenerator implements IDataGenerator {
     public String getDataName() { return "packetCorpus"; }
     public boolean isEnabled() { return System.getenv("PACKETGEN_MANUAL") == null && !"reflective".equals(System.getenv("PACKETGEN_MODE")); }
     public JsonElement generateDataJson() {
-        try (var adapter = new RuntimePacketAdapter(MinecraftDataGenerator.runtimeVersion, MinecraftDataGenerator.outputDirectory.resolve(".packetgen-cache"))) {
-            var result = PacketCorpus.run(adapter, MinecraftDataGenerator.outputDirectory, PacketCorpus.Options.environment());
+        var work = MinecraftDataGenerator.outputDirectory;
+        try (var adapter = new RuntimePacketAdapter(MinecraftDataGenerator.runtimeVersion, work.resolve(".packetgen-cache"))) {
+            var result = PacketCorpus.run(adapter, PacketCorpus.Options.environment(work));
             exitCode = switch (result.get("status").getAsString()) { case "complete" -> 0; case "incomplete" -> 2; default -> 1; };
             return result;
         } catch (Exception e) { throw new IllegalStateException("shared packet generation failed", e); }

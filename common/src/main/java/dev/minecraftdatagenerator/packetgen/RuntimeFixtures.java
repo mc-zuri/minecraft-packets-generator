@@ -2,7 +2,6 @@ package dev.minecraftdatagenerator.packetgen;
 
 import com.google.gson.*;
 import java.lang.reflect.*;
-import java.math.BigInteger;
 import java.util.*;
 import java.util.function.Supplier;
 import java.util.stream.Stream;
@@ -12,11 +11,9 @@ final class RuntimeFixtures implements ReflectionShapes.Fixtures {
     final Object server, registries, world, entity;
     private final List<Object> registryList = new ArrayList<>();
     private final Map<String, ShapePlan> registryPlans = new HashMap<>();
-    private final SortedSet<String> limitations = new TreeSet<>();
     private final Map<Class<?>, List<Class<?>>> subtypes = new HashMap<>();
     private Object player;
     private List<Object> recipes;
-    public Collection<String> limitations() { return limitations; }
     String fingerprint() throws Exception {
         List<String> entries = new ArrayList<>();
         for (Object registry : registryList) if (registry instanceof Iterable<?> values) {
@@ -38,12 +35,12 @@ final class RuntimeFixtures implements ReflectionShapes.Fixtures {
         return PacketCorpus.hash(String.join("\n", entries).getBytes(java.nio.charset.StandardCharsets.UTF_8));
     }
     public List<Class<?>> subtypes(Class<?> type) {
-        if (!Set.of("CustomPacketPayload", "CustomPayload", "LoginQueryRequestPayload", "LoginQueryResponsePayload", "NumberFormat", "NumberFormatType", "RecipeDisplay", "SlotDisplay", "ParticleOptions", "ParticleEffect", "PositionSource").contains(type.getSimpleName())) return List.of();
+        if (!dispatched(type)) return List.of();
         return subtypes.computeIfAbsent(type, cls -> {
             List<Class<?>> result = new ArrayList<>();
-            try (var scan = new io.github.classgraph.ClassGraph().acceptPackages(cls.getPackageName()).overrideClassLoaders(cls.getClassLoader()).enableClassInfo().scan()) {
-                var classes = cls.isInterface() ? scan.getClassesImplementing(cls) : scan.getSubclasses(cls);
-                for (var ci : classes) if (!ci.isAbstract() && !ci.isInterface()) result.add(ci.loadClass());
+            for (String name : implementors(cls)) {
+                try { Class<?> c = Class.forName(name, false, cls.getClassLoader()); if (cls.isAssignableFrom(c)) result.add(c); }
+                catch (ClassNotFoundException | LinkageError ignored) {}
             }
             result.sort(Comparator.<Class<?>>comparingInt(c -> c.getSimpleName().contains("Brand") ? 0 : 1).thenComparing(Class::getName)); return List.copyOf(result);
         });
@@ -84,7 +81,7 @@ final class RuntimeFixtures implements ReflectionShapes.Fixtures {
         }
     }
 
-    @Override public ShapePlan resolve(Type type, String path, int depth) throws Exception {
+    @Override public ShapePlan resolve(Type type, String path, int depth, ReflectionShapes engine) throws Exception {
         Class<?> raw = ReflectionShapes.raw(type); String name = raw.getSimpleName();
         if (name.endsWith("ByteBuf") && (raw.getName().startsWith("net.minecraft.") || raw.getName().startsWith("io.netty."))) {
             return ShapePlan.product("payload-buffer", List.of(ShapePlan.values("bytes", new byte[0], new byte[]{0}, new byte[]{1, -1})), a -> {
@@ -211,8 +208,32 @@ final class RuntimeFixtures implements ReflectionShapes.Fixtures {
             return ShapePlan.union(name, lengths);
         }
         if (name.equals("Pair")) {
-            ReflectionShapes nested = new ReflectionShapes(this, Math.max(1, 6 - depth));
-            return ShapePlan.product("pair", List.of(nested.plan(ReflectionShapes.argument(type, 0)), nested.plan(ReflectionShapes.argument(type, 1))), a -> Reflect.call(raw, "of", a[0], a[1]));
+            // Plan both halves with the calling engine, so their gaps and depth limit stay visible.
+            return ShapePlan.product("pair", List.of(engine.plan(ReflectionShapes.argument(type, 0), path + ".first", depth + 1),
+                    engine.plan(ReflectionShapes.argument(type, 1), path + ".second", depth + 1)), List.of("first", "second"), a -> Reflect.call(raw, "of", a[0], a[1]));
+        }
+        if (name.equals("WorldBorder")) {
+            Object border = Reflect.maybe(world, "getWorldBorder");
+            if (raw.isInstance(border)) return ShapePlan.values("world-border", border);
+        }
+        // Callbacks (e.g. a boss event's dirty listener) are never encoded; a no-op is enough.
+        if (raw == Runnable.class) return ShapePlan.values("no-op", (Runnable) () -> {});
+        if (raw.getName().startsWith("org.joml.")) {
+            ShapePlan joml = joml(raw);
+            if (joml != null) return joml;
+        }
+        if (SERIALIZERS.contains(name)) {
+            ShapePlan serializers = serializers(raw, ReflectionShapes.argument(type, 0));
+            if (serializers != null) return serializers;
+        }
+        if (metadataEntry(raw) && unbound(type)) return metadataEntries(raw, path, depth, engine);
+        if (name.equals("TagKey")) {
+            ShapePlan tags = tagKeys(raw, ReflectionShapes.raw(ReflectionShapes.argument(type, 0)));
+            if (tags != null) return tags;
+        }
+        if (name.equals("HolderSet") || name.equals("RegistryEntryList")) {
+            ShapePlan sets = holderSets(raw, type);
+            if (sets != null) return sets;
         }
         if (name.equals("Style")) try { return ShapePlan.values("empty-style", Reflect.field(raw, "EMPTY")); } catch (Exception ignored) {}
         if (raw.getName().startsWith("net.minecraft.")) {
@@ -267,7 +288,7 @@ final class RuntimeFixtures implements ReflectionShapes.Fixtures {
                 Class<?> type = constructor.getParameterTypes()[i];
                 if (type.isInstance(server)) args[i] = server;
                 else if (type.isInstance(world)) args[i] = world;
-                else if (type.getSimpleName().equals("GameProfile")) args[i] = resolve(type, "player-profile", 0).create(BigInteger.ZERO);
+                else if (type.getSimpleName().equals("GameProfile")) args[i] = ShapePlan.first(resolve(type, "player-profile", 0, null));
                 else if (type.getSimpleName().equals("ServerPlayerInteractionManager")) args[i] = Reflect.construct(type, world);
                 else if (Set.of("PlayerPublicKey", "ProfilePublicKey").contains(type.getSimpleName())) { args[i] = null; continue; } // Optional authentication key on 1.19 players.
                 else args[i] = Reflect.maybe(type, "createDefault", "getDefault");
@@ -298,11 +319,186 @@ final class RuntimeFixtures implements ReflectionShapes.Fixtures {
         return Reflect.construct(Reflect.cls("net.minecraft.text.LiteralText", "net.minecraft.text.StringTextComponent", "net.minecraft.text.TextComponent", "net.minecraft.network.chat.TextComponent"), value);
     }
     @FunctionalInterface interface Maker { Object make() throws Exception; }
-    private static ShapePlan leaf(String name, Maker maker) { return ShapePlan.product(name, List.of(), a -> maker.make()); }
+    private static ShapePlan leaf(String name, Maker maker) { return ShapePlan.product(name, List.of(), List.of(), a -> maker.make()); }
 
+    // ---- subtype index -------------------------------------------------------------------------
+
+    /** Abstract types whose implementations are enumerated, by simple name or binary-name suffix. */
+    private static final Set<String> DISPATCH = Set.of("CustomPacketPayload", "CustomPayload", "LoginQueryRequestPayload", "LoginQueryResponsePayload",
+            "NumberFormat", "NumberFormatType", "RecipeDisplay", "SlotDisplay", "ParticleOptions", "ParticleEffect", "PositionSource", "BossEvent", "BossBar");
+    private static final List<String> DISPATCH_SUFFIXES = List.of("BossEventPacket$Operation", "BossBarS2CPacket$Action", "WorldBorder$BorderExtent", "WorldBorder$Area");
+    private Map<String, List<String>> implementors;
+
+    private boolean dispatched(Class<?> type) {
+        return DISPATCH.contains(type.getSimpleName()) || DISPATCH_SUFFIXES.stream().anyMatch(type.getName()::endsWith);
+    }
+
+    /** Concrete implementations anywhere under net.minecraft, including private nested classes; scanned once. */
+    private List<String> implementors(Class<?> type) {
+        if (implementors == null) {
+            implementors = new HashMap<>();
+            try (var scan = new io.github.classgraph.ClassGraph().acceptPackages("net.minecraft").ignoreClassVisibility()
+                    .overrideClassLoaders(type.getClassLoader()).enableClassInfo().scan()) {
+                for (var ci : scan.getAllClasses()) {
+                    if (ci.isAbstract() || ci.isInterface() || ci.isAnonymousInnerClass()) continue;
+                    for (var parent : ci.getSuperclasses()) implementors.computeIfAbsent(parent.getName(), k -> new ArrayList<>()).add(ci.getName());
+                    for (var parent : ci.getInterfaces()) implementors.computeIfAbsent(parent.getName(), k -> new ArrayList<>()).add(ci.getName());
+                }
+            }
+        }
+        return implementors.getOrDefault(type.getName(), List.of());
+    }
+
+    // ---- value fixtures ------------------------------------------------------------------------
+
+    /** JOML vectors and quaternions, with signed, fractional and NaN components. */
+    private static ShapePlan joml(Class<?> raw) {
+        String name = raw.getSimpleName().replaceFirst("c$", "");
+        Class<?> impl = Reflect.cls("org.joml." + name);
+        if (impl == null || !raw.isAssignableFrom(impl)) return null;
+        ShapePlan f = ShapePlan.values("float", 0f, 1f, -1f, 3.5f, Float.NaN);
+        ShapePlan d = ShapePlan.values("double", 0d, 1d, -1d, 3.5d, Double.NaN);
+        ShapePlan i = ShapePlan.values("int", 0, 1, -1, 127, Integer.MIN_VALUE);
+        return switch (name) {
+            case "Vector3f" -> ShapePlan.product(name, List.of(f, f, f), List.of("x", "y", "z"), a -> Reflect.construct(impl, a));
+            case "Vector3d" -> ShapePlan.product(name, List.of(d, d, d), List.of("x", "y", "z"), a -> Reflect.construct(impl, a));
+            case "Vector3i" -> ShapePlan.product(name, List.of(i, i, i), List.of("x", "y", "z"), a -> Reflect.construct(impl, a));
+            case "Vector2f" -> ShapePlan.product(name, List.of(f, f), List.of("x", "y"), a -> Reflect.construct(impl, a));
+            case "Quaternionf" -> ShapePlan.product(name, List.of(f, f, f, f), List.of("x", "y", "z", "w"), a -> Reflect.construct(impl, a));
+            default -> null;
+        };
+    }
+
+    private static final Set<String> SERIALIZERS = Set.of("EntityDataSerializer", "TrackedDataHandler");
+
+    /** The registered entity-data serializers, optionally only those for one value type. */
+    private ShapePlan serializers(Class<?> raw, Type valueType) {
+        Map<String, Object[]> constants = serializerConstants(raw);
+        if (constants.isEmpty()) return null;
+        List<Object> values = new ArrayList<>(); List<String> labels = new ArrayList<>();
+        boolean bound = !(valueType instanceof TypeVariable<?>) && !(valueType instanceof WildcardType) && valueType != Object.class;
+        for (Map.Entry<String, Object[]> e : constants.entrySet()) {
+            if (bound && !e.getValue()[1].equals(valueType.getTypeName())) continue;
+            values.add(e.getValue()[0]); labels.add(e.getKey());
+        }
+        if (values.isEmpty()) return null;
+        List<java.util.function.Supplier<?>> suppliers = new ArrayList<>();
+        for (Object value : values) suppliers.add(() -> value);
+        return ShapePlan.leaves("serializer", suppliers, labels);
+    }
+
+    /** Field name -> {serializer, value type name}, in declaration order. */
+    private final Map<Class<?>, Map<String, Object[]>> serializerConstants = new HashMap<>();
+    private Map<String, Object[]> serializerConstants(Class<?> serializer) {
+        return serializerConstants.computeIfAbsent(serializer, s -> {
+            Map<String, Object[]> out = new LinkedHashMap<>();
+            Class<?> owner = Reflect.cls(s.getPackageName() + ".EntityDataSerializers", s.getPackageName() + ".TrackedDataHandlerRegistry");
+            if (owner == null) return out;
+            for (Field f : owner.getDeclaredFields()) {
+                if (!Modifier.isStatic(f.getModifiers()) || !s.isAssignableFrom(f.getType()) || !f.trySetAccessible()) continue;
+                try {
+                    Object value = f.get(null);
+                    Type argument = ReflectionShapes.argument(f.getGenericType(), 0);
+                    if (value != null && argument != Object.class) out.put(f.getName(), new Object[]{value, argument.getTypeName(), argument});
+                } catch (IllegalAccessException ignored) {}
+            }
+            return out;
+        });
+    }
+
+    /** Entity metadata entries pair a serializer with a value of its type (DataValue, SerializedEntry, legacy Entry). */
+    private static boolean metadataEntry(Class<?> raw) {
+        Class<?> owner = raw.getEnclosingClass();
+        return raw.getTypeParameters().length == 1 && owner != null && Set.of("SynchedEntityData", "DataTracker").contains(owner.getSimpleName())
+                && Set.of("DataValue", "SerializedEntry", "Entry", "DataEntry", "DataItem").contains(raw.getSimpleName());
+    }
+
+    private static boolean unbound(Type type) {
+        if (type instanceof Class<?>) return true;
+        if (!(type instanceof ParameterizedType p)) return false;
+        Type argument = p.getActualTypeArguments()[0];
+        return argument instanceof WildcardType || argument instanceof TypeVariable<?> || argument == Object.class;
+    }
+
+    /** One branch per serializer, each planned with the entry's type parameter bound to that serializer's value type. */
+    private ShapePlan metadataEntries(Class<?> raw, String path, int depth, ReflectionShapes engine) throws Exception {
+        Class<?> serializer = null;
+        for (String name : SERIALIZERS) for (String pkg : List.of(raw.getPackageName(), "net.minecraft.network.syncher", "net.minecraft.entity.data")) {
+            Class<?> c = Reflect.cls(pkg + "." + name);
+            if (c != null && serializer == null) serializer = c;
+        }
+        if (serializer == null || engine == null) return null;
+        List<ShapePlan> branches = new ArrayList<>();
+        for (Map.Entry<String, Object[]> e : serializerConstants(serializer).entrySet()) {
+            ShapePlan bound = engine.plan(parameterized(raw, (Type) e.getValue()[2]), path + "<" + e.getKey() + ">", depth + 1);
+            branches.add(ShapePlan.product(e.getKey(), List.of(bound), List.of("entry"), a -> a[0]));
+        }
+        return branches.isEmpty() ? null : ShapePlan.union("serializer", branches);
+    }
+
+    /** Tag keys of the registry holding {@code element}; up to three real tags, else one synthetic id. */
+    private ShapePlan tagKeys(Class<?> tagKey, Class<?> element) {
+        Object registry = registryOf(element);
+        if (registry == null) return null;
+        List<Object> tags = new ArrayList<>();
+        for (String method : List.of("getTags", "listTagIds", "getTagNames", "streamTags", "getTagKeys")) {
+            Object found = Reflect.maybe(registry, method);
+            Iterator<?> it = found instanceof Stream<?> s ? s.iterator() : found instanceof Iterable<?> i ? i.iterator() : null;
+            while (it != null && it.hasNext() && tags.size() < 3) {
+                Object tag = it.next();
+                if (!tagKey.isInstance(tag)) tag = Reflect.maybe(tag, "key", "getFirst", "getTag");
+                if (tagKey.isInstance(tag)) tags.add(tag);
+            }
+            if (!tags.isEmpty()) break;
+        }
+        if (tags.isEmpty()) {
+            Object key = Reflect.maybe(registry, "key", "getKey");
+            Class<?> identifier = Reflect.cls("net.minecraft.resources.Identifier", "net.minecraft.resources.ResourceLocation", "net.minecraft.util.Identifier");
+            if (key == null || identifier == null) return null;
+            for (String method : List.of("create", "of")) try { tags.add(Reflect.call(tagKey, method, key, identifier(identifier, "packetgen_tag"))); break; } catch (Exception ignored) {}
+        }
+        return tags.isEmpty() ? null : ShapePlan.values("tag", tags.toArray());
+    }
+
+    /** Direct holder sets of 0, 1 or 2 registry holders. */
+    private ShapePlan holderSets(Class<?> raw, Type type) throws Exception {
+        Class<?> element = ReflectionShapes.raw(ReflectionShapes.argument(type, 0));
+        ShapePlan holder = registry(type.getTypeName() + ":holderset", element, "holder");
+        if (holder == null) return null;
+        List<ShapePlan> sizes = new ArrayList<>();
+        for (int n = 0; n <= 2; n++) {
+            List<String> slots = new ArrayList<>(); for (int i = 0; i < n; i++) slots.add("[" + i + "]");
+            sizes.add(ShapePlan.product("direct=" + n, Collections.nCopies(n, holder), slots, a -> {
+                for (String method : List.of("direct", "of")) try { return Reflect.call(raw, method, List.of(a)); } catch (NoSuchMethodException ignored) {}
+                throw new NoSuchMethodException("HolderSet.direct(List)");
+            }));
+        }
+        return ShapePlan.union("holder-set", sizes);
+    }
+
+    private Object registryOf(Class<?> element) {
+        if (element == Object.class) return null;
+        for (Object registry : registryList) if (registry instanceof Iterable<?> values) {
+            Iterator<?> it = values.iterator();
+            if (it.hasNext() && element.isInstance(it.next())) return registry;
+        }
+        return null;
+    }
+
+    static ParameterizedType parameterized(Class<?> raw, Type... arguments) {
+        return new ParameterizedType() {
+            public Type[] getActualTypeArguments() { return arguments.clone(); }
+            public Type getRawType() { return raw; }
+            public Type getOwnerType() { return raw.getEnclosingClass(); }
+            public String getTypeName() { return raw.getTypeName() + Arrays.toString(arguments); }
+            public boolean equals(Object o) { return o instanceof ParameterizedType p && p.getRawType().equals(raw) && Arrays.equals(p.getActualTypeArguments(), arguments); }
+            public int hashCode() { return raw.hashCode() * 31 + Arrays.hashCode(arguments); }
+        };
+    }
+
+    private static final Class<?> VALUE_DUMP = Reflect.cls("dev.minecraftdatagenerator.packetshapes.ValueDump");
     JsonElement dump(Object value) {
-        Class<?> dump = Reflect.cls("dev.minecraftdatagenerator.packetshapes.ValueDump");
-        if (dump != null && registries != null) try { return (JsonElement) Reflect.call(dump, "dump", value, registries); } catch (Exception ignored) {}
+        if (VALUE_DUMP != null && registries != null) try { return (JsonElement) Reflect.call(VALUE_DUMP, "dump", value, registries); } catch (Exception ignored) {}
         return dump(value, new IdentityHashMap<>(), 0, new int[]{2048});
     }
     private JsonElement dump(Object v, IdentityHashMap<Object, Boolean> seen, int depth, int[] remaining) {

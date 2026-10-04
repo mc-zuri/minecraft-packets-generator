@@ -1,0 +1,2 @@
+# Packet streams are binary zstd data; never convert line endings.
+*.mcpk.zst binary

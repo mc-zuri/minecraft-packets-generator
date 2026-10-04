@@ -3,15 +3,15 @@ package dev.minecraftdatagenerator.packetgen;
 import com.google.gson.*;
 import java.util.*;
 
-/** Recorder shared by generated buffer adapters. Values and spans come from actual vanilla writes. */
+/** Recorder shared by generated buffer adapters. Values and spans come from actual vanilla writes and reads. */
 public final class BufferTrace {
     private record Op(int offset, int size, String kind, Object value) {}
     public record Token(Object buffer, String kind, Object value, int offset, boolean semantic, int depth, boolean reading) {}
     private static final ThreadLocal<BufferTrace> ACTIVE = new ThreadLocal<>();
     private final List<Op> primitives = new ArrayList<>(), semantics = new ArrayList<>();
-    private final TreeMap<Integer, String> reads = new TreeMap<>();
+    private final List<TraceOp> reads = new ArrayList<>();
     private int writeDepth, readDepth;
-    private boolean patched, view, failed;
+    private boolean patched, view, failed, rewound;
     public void begin() { ACTIVE.set(this); }
     public static void end() { ACTIVE.remove(); }
     public static Token before(Object buffer, String kind, Object value, boolean semantic, boolean reading) {
@@ -30,8 +30,12 @@ public final class BufferTrace {
             if (token.depth() > 0) return;
             int end = ((Number) Reflect.call(token.buffer(), token.reading() ? "readerIndex" : "writerIndex")).intValue();
             int size = end - token.offset();
+            if (token.reading()) {
+                if (size < 0) t.rewound = true;
+                else if (size > 0 || !token.kind().equals("skip")) t.reads.add(new TraceOp(token.offset(), size, token.kind(), null));
+                return;
+            }
             if (size < 0) { t.patched = true; return; }
-            if (token.reading()) { t.reads.put(token.offset(), token.kind()); return; }
             Object value = token.value();
             if (token.kind().equals("bytes")) {
                 byte[] bytes = new byte[size]; Reflect.call(token.buffer(), "getBytes", token.offset(), bytes); value = HexFormat.of().formatHex(bytes);
@@ -55,15 +59,34 @@ public final class BufferTrace {
         return a;
     }
     public JsonArray primitives() { JsonArray out = new JsonArray(); primitives.forEach(p -> out.add(json(p))); return out; }
-    public JsonArray reads() { JsonArray out = new JsonArray(); reads.forEach((off, kind) -> { JsonArray a = new JsonArray(); a.add(off); a.add(kind); out.add(a); }); return out; }
-    public JsonArray writes() {
+    /** Outermost semantic writes, plus the primitives they do not cover, in body order. */
+    private List<Op> outer() {
         List<Op> ordered = new ArrayList<>(semantics);
         ordered.sort(Comparator.comparingInt(Op::offset).thenComparing(Comparator.comparingInt(Op::size).reversed()));
         List<Op> outer = new ArrayList<>(); int until = -1;
         for (Op op : ordered) if (op.offset() >= until) { outer.add(op); until = op.offset() + op.size(); }
         ordered = new ArrayList<>(outer);
         for (Op p : primitives) if (outer.stream().noneMatch(o -> p.offset() >= o.offset() && p.offset() + p.size() <= o.offset() + o.size())) ordered.add(p);
-        ordered.sort(Comparator.comparingInt(Op::offset)); JsonArray out = new JsonArray(); ordered.forEach(p -> out.add(json(p))); return out;
+        ordered.sort(Comparator.comparingInt(Op::offset));
+        return ordered;
+    }
+    public JsonArray writes() { JsonArray out = new JsonArray(); outer().forEach(p -> out.add(json(p))); return out; }
+    public List<TraceOp> writeOps() {
+        List<TraceOp> out = new ArrayList<>();
+        for (Op op : outer()) {
+            Object value = op.value();
+            if (value instanceof JsonArray xyz) value = new int[]{xyz.get(0).getAsInt(), xyz.get(1).getAsInt(), xyz.get(2).getAsInt()};
+            else if (op.kind().equals("bytes") || op.kind().equals("string")) value = null;
+            out.add(new TraceOp(op.offset(), op.size(), op.kind(), value));
+        }
+        return out;
+    }
+    public List<TraceOp> readOps() { return reads; }
+    public boolean rewound() { return rewound; }
+    public boolean writeComplete(int length) {
+        int cursor = 0; boolean complete = !failed && !patched && !view;
+        for (Op p : primitives) { if (p.offset() != cursor) complete = false; cursor = p.offset() + p.size(); }
+        return complete && cursor == length;
     }
     public JsonObject coverage(int length) {
         int cursor = 0; boolean complete = !failed && !patched && !view;

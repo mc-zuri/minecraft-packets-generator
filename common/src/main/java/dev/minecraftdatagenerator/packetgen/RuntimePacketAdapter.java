@@ -22,6 +22,8 @@ public final class RuntimePacketAdapter implements PacketAdapter {
     private String fingerprint;
     private String fixtureFingerprint;
     private final JsonObject contexts = new JsonObject();
+    private static final Class<?> UNPOOLED = Reflect.cls("io.netty.buffer.Unpooled");
+    private Class<?> writeTrace, readTrace;
 
     public RuntimePacketAdapter(String version, Path cache) throws Exception {
         // Mojang's launcher id "1.7" is the protocol-3 prerelease. The data
@@ -62,7 +64,7 @@ public final class RuntimePacketAdapter implements PacketAdapter {
             List<Class<?>> classes = new ArrayList<>(List.of(packetBase, RuntimePacketAdapter.class, Class.forName("io.netty.buffer.ByteBuf")));
             providers.values().forEach(p -> classes.add(p.getClass()));
             fixtureFingerprint = fixtures.fingerprint();
-            fingerprint = RuntimeFingerprint.of("packetgen-v3\n" + version + "\n" + packetBase.getName() + "\n" + fixtureFingerprint, classes);
+            fingerprint = RuntimeFingerprint.of("packetgen-v4\n" + version + "\n" + packetBase.getName() + "\n" + fixtureFingerprint, classes);
         }
         return fingerprint;
     }
@@ -177,104 +179,123 @@ public final class RuntimePacketAdapter implements PacketAdapter {
         if (cls == null) throw new IllegalStateException("registered packet class could not be resolved: " + entry.key());
         if (plans.containsKey(entry.key())) return plans.get(entry.key());
         if (entry.name().equals("bundle_delimiter")) {
-            Object input = buffer(new byte[0], true);
-            try { return new Plan(ShapePlan.values("registered-unit", decodeFrom(entry, input)), List.of()); }
-            finally { Reflect.call(input, "release"); }
+            Object unit = decode(entry, new byte[0]).value();
+            return new Plan(null, ShapePlan.values("registered-unit", unit), List.of(), List.of());
         }
-        List<ShapePlan> alternatives = new ArrayList<>(); List<String> gaps = new ArrayList<>();
+        List<ShapePlan> seeds = new ArrayList<>(); List<String> unresolved = new ArrayList<>();
         if (!modern && fixtures.world != null && LegacyReceiveState.hasPackedChunkRecords(cls)) {
             Object chunk = Reflect.call(fixtures.world, "getChunk", 0, 0);
-            alternatives.add(ShapePlan.product("vanilla-chunk-update-constructor", List.of(
+            seeds.add(ShapePlan.product("vanilla-chunk-update-constructor", List.of(
                 ShapePlan.values("positions", new short[0], new short[] { 0 }, new short[] { 0x1234, (short) 0xffff })),
                 a -> { short[] positions = (short[]) a[0]; return Reflect.construct(cls, positions.length, positions, chunk); }));
         }
         if (entry.name().equals("custom_payload") && entry.direction().equals("toClient")) {
             Class<?> brand = Reflect.cls("net.minecraft.network.protocol.common.custom.BrandPayload");
-            if (brand != null) alternatives.add(ShapePlan.product("brand-seed", List.of(ShapePlan.values("brand", "", "packetgen")), a -> Reflect.construct(cls, Reflect.construct(brand, a[0]))));
+            if (brand != null) seeds.add(ShapePlan.product("brand-seed", List.of(ShapePlan.values("brand", "", "packetgen")), a -> Reflect.construct(cls, Reflect.construct(brand, a[0]))));
         }
         Object provider = providers.get(cls);
         if (provider != null) try {
             List<?> samples = (List<?>) Reflect.call(provider, "shapes", shapeContext);
             List<SupplierValue> values = new ArrayList<>(); for (Object value : samples) values.add(new SupplierValue(value));
-            alternatives.add(ShapePlan.leaves("manual:" + provider.getClass().getName(), values));
-        } catch (Exception e) { gaps.add("manual provider: " + Reflect.error(e)); }
+            seeds.add(ShapePlan.leaves("manual:" + provider.getClass().getSimpleName(), values));
+        } catch (Exception e) { unresolved.add("manual provider: " + Reflect.error(e)); }
         ReflectionShapes reflection = new ReflectionShapes(fixtures, 6);
-        ShapePlan exploration = reflection.plan(cls); gaps.addAll(reflection.gaps());
-        Plan plan = new Plan(ShapePlan.seeded(cls.getName(), alternatives, exploration), List.copyOf(gaps)); plans.put(entry.key(), plan); return plan;
+        ShapePlan exploration = reflection.plan(cls);
+        unresolved.addAll(reflection.unresolved());
+        Plan plan = new Plan(seeds.isEmpty() ? null : ShapePlan.union("seeds", seeds), exploration, List.copyOf(unresolved), List.copyOf(reflection.terminal()));
+        plans.put(entry.key(), plan); return plan;
     }
     private record SupplierValue(Object value) implements java.util.function.Supplier<Object> { public Object get() { return value; } }
 
     private Object wrap(Object buffer) throws Exception {
         return registryBuffer != null && fixtures.registries != null ? Reflect.construct(registryBuffer, buffer, fixtures.registries) : Reflect.construct(bufferClass, buffer);
     }
-    private Object buffer(byte[] body, boolean reading) throws Exception {
-        if (!modern) return reading ? generated.input(body) : generated.output();
-        Class<?> trace = Class.forName("dev.minecraftdatagenerator.packetshapes." + (reading ? "ReadTrace" : "WireTrace"));
-        return reading ? Reflect.construct(trace, body) : Reflect.construct(trace);
+    private Object tracingBuffer(byte[] body) throws Exception {
+        if (!modern) return body == null ? generated.output() : generated.input(body);
+        if (writeTrace == null) {
+            writeTrace = Class.forName("dev.minecraftdatagenerator.packetshapes.WireTrace");
+            readTrace = Class.forName("dev.minecraftdatagenerator.packetshapes.ReadTrace");
+        }
+        return body == null ? Reflect.construct(writeTrace) : Reflect.construct(readTrace, body);
     }
     private void encodeInto(Entry entry, Object instance, Object target) throws Exception {
-        if (modern) Reflect.call(entry.codec(), "encode", wrap(target), instance);
-        else Reflect.call(instance, "write", target);
+        try {
+            if (modern) Reflect.call(entry.codec(), "encode", wrap(target), instance);
+            else Reflect.call(instance, "write", target);
+        } catch (Exception e) {
+            if (Reflect.cause(e).getClass().getName().equals("net.minecraft.network.SkipPacketEncoderException"))
+                throw new PacketAdapter.EncoderSkipped(Reflect.cause(e));
+            throw e;
+        }
     }
+
+    /** Legacy packet tables differ in how a packet is created from bytes. The first strategy that
+     * exists for an entry is remembered, so later attempts do not fail through missing methods. */
+    @FunctionalInterface private interface LegacyDecoder { Object decode(Entry entry, Legacy legacy, Object input) throws Exception; }
+    private static final List<LegacyDecoder> LEGACY_DECODERS = List.of(
+        (e, l, in) -> Reflect.call(Reflect.call(l.protocol(), "getHandler", l.direction()), "createPacket", e.id(), in),
+        (e, l, in) -> Reflect.call(l.protocol(), "getPacketHandler", l.direction(), e.id(), in),
+        (e, l, in) -> Reflect.call(l.protocol(), "createPacket", l.direction(), e.id(), in),
+        (e, l, in) -> Reflect.call(Reflect.call(l.protocol(), "codec", l.direction()), "createPacket", e.id(), in),
+        (e, l, in) -> Reflect.construct(e.packetClass(), in),
+        (e, l, in) -> { Object value = Reflect.construct(e.packetClass()); Reflect.call(value, "read", in); return value; });
+    private final Map<String, LegacyDecoder> legacyDecoders = new HashMap<>();
+
     private Object decodeFrom(Entry entry, Object input) throws Exception {
         if (modern) return Reflect.call(entry.codec(), "decode", wrap(input));
         Legacy legacy = (Legacy) entry.codec();
-        try { return Reflect.call(Reflect.call(legacy.protocol(), "getHandler", legacy.direction()), "createPacket", entry.id(), input); }
-        catch (NoSuchMethodException ignored) {}
-        for (String method : List.of("getPacketHandler", "createPacket")) {
-            try { return Reflect.call(legacy.protocol(), method, legacy.direction(), entry.id(), input); }
-            catch (NoSuchMethodException ignored) {}
+        LegacyDecoder known = legacyDecoders.get(entry.key());
+        if (known != null) return known.decode(entry, legacy, input);
+        NoSuchMethodException missing = null;
+        for (LegacyDecoder decoder : LEGACY_DECODERS) {
+            try {
+                Object value = decoder.decode(entry, legacy, input);
+                legacyDecoders.put(entry.key(), decoder);
+                return value;
+            } catch (NoSuchMethodException e) { missing = e; }
         }
-        try {
-            Object codec = Reflect.call(legacy.protocol(), "codec", legacy.direction());
-            return Reflect.call(codec, "createPacket", entry.id(), input);
-        } catch (NoSuchMethodException ignored) {}
-        try { return Reflect.construct(entry.packetClass(), input); }
-        catch (NoSuchMethodException e) { Object value = Reflect.construct(entry.packetClass()); Reflect.call(value, "read", input); return value; }
+        throw missing;
     }
     private static byte[] bytes(Object buffer) throws Exception {
         int len = ((Number) Reflect.call(buffer, "writerIndex")).intValue(); byte[] bytes = new byte[len]; Reflect.call(buffer, "getBytes", 0, bytes); return bytes;
     }
-    public Encoded encode(Entry entry, Object instance) throws Exception {
+
+    public byte[] encode(Entry entry, Object instance) throws Exception {
         if (!modern) LegacyReceiveState.validateSource(instance);
-        JsonObject evidence = new JsonObject(); BufferTrace recording = new BufferTrace(); Object out = buffer(null, false);
-        Class<?> wire = modern ? out.getClass() : null;
-        byte[] body;
+        Object raw = Reflect.call(UNPOOLED, "buffer");
         try {
-            if (modern) Reflect.call(wire, "begin"); else recording.begin();
+            encodeInto(entry, instance, modern ? raw : wrap(raw));
+            return bytes(raw);
+        } finally { Reflect.call(raw, "release"); }
+    }
+
+    @SuppressWarnings("unchecked")
+    public Traced encodeTraced(Entry entry, Object instance) throws Exception {
+        Object out = tracingBuffer(null);
+        BufferTrace recording = new BufferTrace();
+        try {
+            if (modern) Reflect.call(writeTrace, "begin"); else recording.begin();
             try { encodeInto(entry, instance, out); }
-            catch (Exception e) {
-                if (Reflect.cause(e).getClass().getName().equals("net.minecraft.network.SkipPacketEncoderException"))
-                    throw new PacketAdapter.EncoderSkipped(Reflect.cause(e));
-                throw e;
-            } finally { if (modern) Reflect.call(wire, "end"); else BufferTrace.end(); }
-            body = bytes(out);
-            evidence.add("trace", modern ? (JsonElement) Reflect.call(out, "toJson") : recording.writes());
-            evidence.add("primitiveTrace", modern ? (JsonElement) Reflect.call(out, "primitives") : recording.primitives());
-            evidence.add("traceCoverage", modern ? (JsonElement) Reflect.call(out, "coverage") : recording.coverage(body.length));
+            finally { if (modern) Reflect.call(writeTrace, "end"); else BufferTrace.end(); }
+            byte[] body = bytes(out);
+            if (modern) return new Traced(body, (List<TraceOp>) Reflect.call(out, "ops"), (Boolean) Reflect.call(out, "complete"));
+            return new Traced(body, recording.writeOps(), recording.writeComplete(body.length));
         } finally { Reflect.call(out, "release"); }
-        Object in = buffer(body, true); boolean consumed = false, stable = false;
-        BufferTrace readRecording = new BufferTrace();
+    }
+
+    @SuppressWarnings("unchecked")
+    public Decoded decode(Entry entry, byte[] body) throws Exception {
+        Object in = tracingBuffer(body);
+        BufferTrace recording = new BufferTrace();
         try {
-            Object decoded;
-            if (!modern) readRecording.begin();
-            try { decoded = decodeFrom(entry, in); } finally { if (!modern) BufferTrace.end(); }
-            consumed = ((Number) Reflect.call(in, "readableBytes")).intValue() == 0;
-            if (!modern) {
-                String restored = LegacyReceiveState.restore(decoded);
-                if (restored != null) evidence.addProperty("receiveStateRestored", restored);
-            }
-            Object second = Reflect.call(Class.forName("io.netty.buffer.Unpooled"), "buffer");
-            try {
-                try { encodeInto(entry, decoded, modern ? second : wrap(second)); stable = Arrays.equals(body, bytes(second)); }
-                catch (Exception e) { evidence.addProperty("reencodeError", Reflect.error(e)); }
-            } finally { Reflect.call(second, "release"); }
-        } catch (Exception e) { evidence.addProperty("decodeError", Reflect.error(e)); }
-        finally {
-            evidence.add("reads", modern ? (JsonElement) Reflect.call(in, "toJson") : readRecording.reads()); Reflect.call(in, "release");
-        }
-        evidence.addProperty("traceFormatVersion", 2); evidence.addProperty("fullyConsumed", consumed); evidence.addProperty("roundTrip", stable);
-        return new Encoded(body, evidence);
+            Object value;
+            if (!modern) recording.begin();
+            try { value = decodeFrom(entry, in); } finally { if (!modern) BufferTrace.end(); }
+            boolean consumed = ((Number) Reflect.call(in, "readableBytes")).intValue() == 0;
+            String restored = modern ? null : LegacyReceiveState.restore(value);
+            if (modern) return new Decoded(value, (List<TraceOp>) Reflect.call(in, "ops"), consumed, (Boolean) Reflect.call(in, "rewound"), null);
+            return new Decoded(value, recording.readOps(), consumed, recording.rewound(), restored);
+        } finally { Reflect.call(in, "release"); }
     }
     public JsonElement dump(Object value) { return fixtures.dump(value); }
     public void close() throws Exception { if (generated != null) generated.close(); }

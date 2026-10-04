@@ -21,7 +21,21 @@ public final class BufferTracingTest {
                 int length = ((Number) Reflect.call(raw, "writerIndex")).intValue();
                 if (length != 14 || !recorder.coverage(length).get("complete").getAsBoolean()) throw new AssertionError("underlying-buffer writes were missed: " + recorder.coverage(length) + " " + recorder.primitives());
                 if (recorder.primitives().size() < 3) throw new AssertionError("primitive operations were collapsed");
-                System.out.println("Buffer tracing passed: " + recorder.primitives());
+                if (!recorder.writeComplete(length) || recorder.writeOps().size() != 3) throw new AssertionError("write ops: " + recorder.writeOps());
+                byte[] body = new byte[length]; Reflect.call(raw, "getBytes", 0, body);
+                Object in = generated.input(body);
+                try {
+                    BufferTrace reads = new BufferTrace(); reads.begin();
+                    try {
+                        Reflect.call(in, "readInt");
+                        Reflect.call(in, "readBytes", (Object) new byte[2]);
+                        // A string payload is consumed by moving the reader index; it must still be accounted for.
+                        Reflect.call(in, "readerIndex", 14);
+                    } finally { BufferTrace.end(); }
+                    String ops = reads.readOps().stream().map(op -> op.off() + ":" + op.len() + ":" + op.kind()).toList().toString();
+                    if (!ops.equals("[0:4:i32, 4:2:bytes, 6:8:skip]") || reads.rewound()) throw new AssertionError("read ops: " + ops);
+                    System.out.println("Buffer tracing passed: " + recorder.primitives() + " reads " + ops);
+                } finally { Reflect.call(in, "release"); }
             } finally { Reflect.call(outer, "release"); }
         }
     }

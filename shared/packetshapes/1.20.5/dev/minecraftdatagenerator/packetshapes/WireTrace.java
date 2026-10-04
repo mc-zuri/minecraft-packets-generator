@@ -2,6 +2,7 @@ package dev.minecraftdatagenerator.packetshapes;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
+import dev.minecraftdatagenerator.packetgen.TraceOp;
 import java.util.ArrayDeque;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
@@ -328,6 +329,58 @@ public final class WireTrace extends FriendlyByteBuf {
     @Override public int setBytes(int index, java.nio.channels.FileChannel input, long position, int length) throws java.io.IOException { patched = true; return super.setBytes(index, input, position, length); }
 
     // ---- export --------------------------------------------------------------------------------
+
+    /** True when the primitive writes partition the body and no write moved bytes behind them. */
+    public boolean complete() {
+        int cursor = 0;
+        for (Raw r : raw) {
+            if (r.off != cursor || r.len < 0) return false;
+            cursor = r.off + r.len;
+        }
+        return cursor == writerIndex() && !patched && !exposedView;
+    }
+
+    /**
+     * The semantic write ops, grouped exactly as {@link #toJson()}: one op per var-int, var-long,
+     * string and block position, one per remaining primitive. Numeric values are kept; block
+     * positions carry vanilla's own {@code int[]{x, y, z}}; byte runs carry only their length.
+     */
+    public List<TraceOp> ops() {
+        List<TraceOp> out = new ArrayList<>();
+        int i = 0;
+        while (i < raw.size()) {
+            Raw r = raw.get(i);
+            if (("varint".equals(r.owner) || "varlong".equals(r.owner)) && varEnd(i) > i) {
+                int end = varEnd(i);
+                long v = varValue(i, end);
+                out.add(new TraceOp(r.off, span(i, end), r.owner, "varint".equals(r.owner) ? (Object) (int) v : (Object) v));
+                i = end;
+            } else if ("string".equals(r.owner) && varEnd(i) > i) {
+                int lenEnd = varEnd(i);
+                int n = (int) varValue(i, lenEnd);
+                int got = 0;
+                int j = lenEnd;
+                while (j < raw.size() && "string".equals(raw.get(j).owner) && (got < n || raw.get(j).len == 0)) {
+                    got += raw.get(j).len;
+                    j++;
+                }
+                out.add(new TraceOp(r.off, span(i, j), "string", null));
+                i = j;
+            } else if ("blockpos".equals(r.owner) && "i64".equals(r.kind)) {
+                long p = (Long) r.value;
+                out.add(new TraceOp(r.off, 8, "blockpos", new int[]{BlockPos.getX(p), BlockPos.getY(p), BlockPos.getZ(p)}));
+                i++;
+            } else {
+                out.add(new TraceOp(r.off, r.len, r.kind, r.value instanceof byte[] ? null : r.value));
+                i++;
+            }
+        }
+        return out;
+    }
+
+    public boolean exposedView() {
+        return exposedView;
+    }
 
     /**
      * The trace as {@code [[offset, length, kind, value], ...]}, offsets relative to the packet body.
